@@ -79,6 +79,28 @@ class StoragePolicyConfig:
     reuse_ema_scale_blocks: int = 50000
     shadow_slc_physical_blocks: int = 0
     shadow_tlc_physical_blocks: int = 0
+    # everglint_joint: unified net-gain Drop / Move-to-SLC / Move-to-TLC policy.
+    everglint_mode: str = "everglint"
+    everglint_wear_lambda: float = 1.0e8
+    everglint_wear_eta: float = 0.1
+    everglint_slc_physical_bytes: int = 0
+    everglint_tlc_physical_bytes: int = 0
+    everglint_slc_pe_limit: float = 30000.0
+    everglint_tlc_pe_limit: float = 3000.0
+    everglint_slc_waf_est: float = 1.0
+    everglint_tlc_waf_est: float = 1.0
+    everglint_horizon_requests: int = 4096
+    everglint_chunk_blocks: int = 16
+    everglint_candidate_limit: int = 32
+    everglint_victim_limit: int = 64
+    everglint_use_survival: bool = True
+    everglint_use_prefix_cost: bool = True
+    everglint_allow_drop: bool = True
+    everglint_use_value_victim: bool = True
+    everglint_prior_reuse_prob: float = 0.5
+    everglint_prior_weight: float = 10.0
+    everglint_residence_ema_alpha: float = 0.05
+    everglint_trim_gamma: float = 0.25
 
 
 @dataclass(frozen=True, slots=True)

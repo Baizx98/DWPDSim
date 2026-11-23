@@ -423,8 +423,63 @@ PYBIND11_MODULE(_core, module) {
                          std::uint64_t min_reuse_blocks,
                          std::uint64_t reuse_ema_scale_blocks,
                          std::uint64_t shadow_slc_physical_blocks,
-                         std::uint64_t shadow_tlc_physical_blocks
+                         std::uint64_t shadow_tlc_physical_blocks,
+                         const std::string& everglint_mode,
+                         double everglint_wear_lambda,
+                         double everglint_wear_eta,
+                         std::uint64_t everglint_slc_physical_bytes,
+                         std::uint64_t everglint_tlc_physical_bytes,
+                         double everglint_slc_pe_limit,
+                         double everglint_tlc_pe_limit,
+                         double everglint_slc_waf_est,
+                         double everglint_tlc_waf_est,
+                         std::uint64_t everglint_horizon_requests,
+                         std::uint64_t everglint_chunk_blocks,
+                         std::uint64_t everglint_candidate_limit,
+                         std::uint64_t everglint_victim_limit,
+                         bool everglint_use_survival,
+                         bool everglint_use_prefix_cost,
+                         bool everglint_allow_drop,
+                         bool everglint_use_value_victim,
+                         double everglint_prior_reuse_prob,
+                         double everglint_prior_weight,
+                         double everglint_residence_ema_alpha,
+                         double everglint_trim_gamma
                      ) {
+                if (storage_policy == "everglint_joint") {
+                    const EverglintJointPolicyConfig joint_cfg{
+                        everglint_mode,
+                        admit_storage_hits,
+                        everglint_wear_lambda,
+                        everglint_wear_eta,
+                        everglint_slc_physical_bytes,
+                        everglint_tlc_physical_bytes,
+                        everglint_slc_pe_limit,
+                        everglint_tlc_pe_limit,
+                        everglint_slc_waf_est,
+                        everglint_tlc_waf_est,
+                        everglint_horizon_requests,
+                        everglint_chunk_blocks,
+                        everglint_candidate_limit,
+                        everglint_victim_limit,
+                        everglint_use_survival,
+                        everglint_use_prefix_cost,
+                        everglint_allow_drop,
+                        everglint_use_value_victim,
+                        everglint_prior_reuse_prob,
+                        everglint_prior_weight,
+                        everglint_residence_ema_alpha,
+                        logical_fill_fraction,
+                        everglint_trim_gamma,
+                    };
+                    return std::make_unique<Simulator>(
+                        std::move(config),
+                        nullptr,
+                        nullptr,
+                        std::filesystem::path(trace_path),
+                        std::make_unique<EverglintJointPolicy>(joint_cfg)
+                    );
+                }
                 if (slc_host_share <= 0.0 || slc_host_share >= 1.0) {
                     throw py::value_error("slc_host_share must be between 0 and 1");
                 }
@@ -565,7 +620,28 @@ PYBIND11_MODULE(_core, module) {
             py::arg("min_reuse_blocks") = 4096ULL,
             py::arg("reuse_ema_scale_blocks") = 50000ULL,
             py::arg("shadow_slc_physical_blocks") = 0ULL,
-            py::arg("shadow_tlc_physical_blocks") = 0ULL
+            py::arg("shadow_tlc_physical_blocks") = 0ULL,
+            py::arg("everglint_mode") = "everglint",
+            py::arg("everglint_wear_lambda") = 1.0e8,
+            py::arg("everglint_wear_eta") = 0.1,
+            py::arg("everglint_slc_physical_bytes") = 0ULL,
+            py::arg("everglint_tlc_physical_bytes") = 0ULL,
+            py::arg("everglint_slc_pe_limit") = 30000.0,
+            py::arg("everglint_tlc_pe_limit") = 3000.0,
+            py::arg("everglint_slc_waf_est") = 1.0,
+            py::arg("everglint_tlc_waf_est") = 1.0,
+            py::arg("everglint_horizon_requests") = 4096ULL,
+            py::arg("everglint_chunk_blocks") = 16ULL,
+            py::arg("everglint_candidate_limit") = 32ULL,
+            py::arg("everglint_victim_limit") = 64ULL,
+            py::arg("everglint_use_survival") = true,
+            py::arg("everglint_use_prefix_cost") = true,
+            py::arg("everglint_allow_drop") = true,
+            py::arg("everglint_use_value_victim") = true,
+            py::arg("everglint_prior_reuse_prob") = 0.5,
+            py::arg("everglint_prior_weight") = 10.0,
+            py::arg("everglint_residence_ema_alpha") = 0.05,
+            py::arg("everglint_trim_gamma") = 0.25
         )
         .def("storage_performance", [](const Simulator& simulator) {
             py::dict result;

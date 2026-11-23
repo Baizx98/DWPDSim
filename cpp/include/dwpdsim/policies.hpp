@@ -1,5 +1,7 @@
 #pragma once
 
+#include "dwpdsim/policies/joint/everglint_joint_policy.hpp"
+#include "dwpdsim/policies/joint/joint_cache_policy.hpp"
 #include "dwpdsim/policies/memory/baseline_memory_lru_policy.hpp"
 #include "dwpdsim/policies/memory/context_memory_lru_policy.hpp"
 #include "dwpdsim/policies/memory/indexed_memory_lru_policy.hpp"

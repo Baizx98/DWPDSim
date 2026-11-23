@@ -80,15 +80,21 @@ Simulator::Simulator(
     SimulationConfig config,
     std::unique_ptr<MemoryPolicy> memory_policy,
     std::unique_ptr<StoragePolicy> storage_policy,
-    const std::filesystem::path& trace_path
+    const std::filesystem::path& trace_path,
+    std::unique_ptr<JointCachePolicy> joint_policy
 )
     : config_(validate_config(std::move(config))),
       memory_capacity_blocks_(config_.memory.capacity_bytes / config_.block_size_bytes),
       storage_(config_),
       memory_policy_(std::move(memory_policy)),
       storage_policy_(std::move(storage_policy)),
+      joint_policy_(std::move(joint_policy)),
       metrics_(config_),
       trace_writer_(trace_path, config_.block_size_bytes, !config_.infinite_storage) {
+    if (joint_policy_) {
+        joint_policy_->bind_tree(tree_);
+        return;
+    }
     memory_policy_->bind_tree(tree_);
     if (!config_.infinite_storage) {
         next_background_tick_ns_ = storage_policy_->background_schedule().period_ns;
@@ -132,10 +138,61 @@ void Simulator::process_request(
         HashSpan{hash_ids, hash_count},
         span(protected_prefix_),
     };
-    if (!config_.infinite_storage) { storage_policy_->on_request_begin(request, storage_view()); }
-    {
-        MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
-        memory_policy_->on_request_begin(request, tree_);
+    if (joint_policy_) {
+        joint_policy_->on_request_begin(request, storage_view());
+        const auto trims = joint_policy_->collect_proactive_trims(request, storage_view());
+        if (!trims.empty()) {
+            const TraceContext tctx{timestamp_ns, request_id, std::nullopt};
+            std::array<std::vector<NodeId>, 2> trimmed_by_tier;
+            for (const auto& [tier, trim_id] : trims) {
+                if (!tree_.contains(trim_id)) {
+                    continue;
+                }
+                Node& tnode = tree_.node(trim_id);
+                if (!tnode.on_storage || tnode.storage_tier != tier) {
+                    continue;
+                }
+                const StorageLocation loc = tnode.storage_location();
+                emit_io(tctx, trim_id, Operation::Trim, tnode, loc, TraceReason::IdleEviction);
+                metrics_.record_io(Operation::Trim, loc.tier, loc.stream_id);
+                storage_.tier(loc.tier).release(loc.block_address);
+                metrics_.storage_removed(loc.tier, tnode.in_memory);
+                tnode.clear_storage_location();
+                trimmed_by_tier[storage_tier_index(tier)].push_back(trim_id);
+            }
+            for (std::size_t t = 0; t < 2; ++t) {
+                if (trimmed_by_tier[t].empty()) {
+                    continue;
+                }
+                const StorageTier tier = t == 0 ? StorageTier::Slc : StorageTier::Tlc;
+                notify_storage_commit(StorageMutation{
+                    StorageMutationKind::IdleTrimCommitted,
+                    timestamp_ns,
+                    0,
+                    trimmed_by_tier[t].front(),
+                    span(trimmed_by_tier[t]),
+                    Placement{tier, 0},
+                    tier,
+                    trimmed_by_tier[t].size() * config_.block_size_bytes,
+                });
+                add_counts(
+                    metrics_.background_idle_evictions,
+                    trimmed_by_tier[t].size(),
+                    config_.block_size_bytes
+                );
+                for (NodeId trim_id : trimmed_by_tier[t]) {
+                    if (tree_.contains(trim_id)) {
+                        prune_from(trim_id);
+                    }
+                }
+            }
+        }
+    } else {
+        if (!config_.infinite_storage) { storage_policy_->on_request_begin(request, storage_view()); }
+        {
+            MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
+            memory_policy_->on_request_begin(request, tree_);
+        }
     }
     metrics_.record_request(timestamp_ns);
     last_timestamp_ns_ = timestamp_ns;
@@ -158,11 +215,15 @@ void Simulator::process_request(
                                               );
         if (created) {
             ++metrics_.tree_nodes_created;
-            {
-                MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
-                memory_policy_->on_node_created(node_id, tree_);
+            if (joint_policy_) {
+                joint_policy_->on_node_created(node_id, tree_);
+            } else {
+                {
+                    MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
+                    memory_policy_->on_node_created(node_id, tree_);
+                }
+                if (!config_.infinite_storage) { storage_policy_->on_node_created(node_id, storage_view()); }
             }
-            if (!config_.infinite_storage) { storage_policy_->on_node_created(node_id, storage_view()); }
         }
         const AccessResult result = process_access(AccessContext{
             request,
@@ -180,7 +241,14 @@ void Simulator::process_request(
         shadow_->record_request(hit_blocks, ghost_prefix > hit_blocks ? ghost_prefix - hit_blocks : 0);
     }
     metrics_.compute_cost += (metrics_.global_misses - misses_before) * hash_count;
-    {
+    if (joint_policy_) {
+        joint_policy_->on_request_end(
+            request,
+            storage_view(),
+            hit_blocks,
+            metrics_.global_misses - misses_before
+        );
+    } else {
         MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
         memory_policy_->on_request_end(request, tree_);
     }
@@ -256,6 +324,9 @@ StoragePolicyStats Simulator::storage_policy_stats() const {
         StoragePolicyStats result;
         result.tlc_program_bytes = metrics_.io[1].writes * config_.block_size_bytes;
         return result;
+    }
+    if (joint_policy_) {
+        return joint_policy_->stats(storage_view());
     }
     return storage_policy_->stats(storage_view());
 }
@@ -347,7 +418,7 @@ std::uint64_t Simulator::emit_io(
 }
 
 void Simulator::run_until(TimestampNs target_ns) {
-    if (config_.infinite_storage) { return; }
+    if (config_.infinite_storage || joint_policy_) { return; }
     const auto background_period = storage_policy_->background_schedule().period_ns;
     const auto advance = [](TimestampNs& next, TimestampNs period) {
         next = next > std::numeric_limits<TimestampNs>::max() - period ? 0 : next + period;
@@ -420,6 +491,27 @@ AccessResult Simulator::process_access(const AccessContext& context) {
 
         if (config_.infinite_storage) {
             metrics_.record_io(Operation::Read, StorageTier::Tlc, 0);
+        } else if (joint_policy_) {
+            const std::vector<NodeId> single_node{context.node_id};
+            notify_storage_commit(StorageMutation{
+                StorageMutationKind::StorageAccessCommitted,
+                context.request.timestamp_ns,
+                context.request.affinity_id,
+                context.node_id,
+                span(single_node),
+                Placement{source.tier, source.stream_id},
+                source.tier,
+                0,
+            });
+            emit_io(
+                trace_context(context),
+                context.node_id,
+                Operation::Read,
+                node,
+                source,
+                TraceReason::StorageHit
+            );
+            metrics_.record_io(Operation::Read, source.tier, source.stream_id);
         } else {
             const NodeId endpoint = tree_.segment_leaf_for(context.node_id);
             const std::vector<NodeId> accessed_segment_nodes =
@@ -500,7 +592,10 @@ AccessResult Simulator::process_access(const AccessContext& context) {
             }
         }
 
-        if (memory_policy_->admit_storage_hit(context, node, tree_)) {
+        const bool promote = joint_policy_
+                                 ? joint_policy_->admit_storage_hit(context, node, tree_)
+                                 : memory_policy_->admit_storage_hit(context, node, tree_);
+        if (promote) {
             ++metrics_.storage_promotions;
             insert_into_memory(context.node_id, context);
         } else {
@@ -518,7 +613,11 @@ AccessResult Simulator::process_access(const AccessContext& context) {
 
 void Simulator::notify_memory_commit(const MemoryMutation& mutation) {
     MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
-    memory_policy_->on_commit(mutation);
+    if (joint_policy_) {
+        joint_policy_->on_memory_commit(mutation, tree_);
+    } else {
+        memory_policy_->on_commit(mutation);
+    }
 }
 
 void Simulator::insert_into_memory(NodeId node_id, const AccessContext& context) {
@@ -534,6 +633,109 @@ void Simulator::insert_into_memory(NodeId node_id, const AccessContext& context)
 }
 
 void Simulator::evict_from_memory(const AccessContext& context) {
+    if (joint_policy_) {
+        const JointEvictionPlan plan = [&] {
+            MemoryTimer timer(config_.profile_memory, memory_decision_ns);
+            ++memory_decisions;
+            return joint_policy_->plan_eviction(context, storage_view());
+        }();
+        if (plan.memory_nodes.empty()) {
+            throw std::logic_error("JointCachePolicy returned empty eviction plan");
+        }
+
+        const TraceContext tctx = trace_context(context);
+        if (plan.kind == JointActionKind::MoveToSlc || plan.kind == JointActionKind::MoveToTlc) {
+            if (!plan.ssd_trim_nodes.empty()) {
+                for (NodeId trim_id : plan.ssd_trim_nodes) {
+                    Node& tnode = tree_.node(trim_id);
+                    const StorageLocation loc = tnode.storage_location();
+                    emit_io(tctx, trim_id, Operation::Trim, tnode, loc, TraceReason::CapacityEviction);
+                    metrics_.record_io(Operation::Trim, loc.tier, loc.stream_id);
+                    storage_.tier(loc.tier).release(loc.block_address);
+                    metrics_.storage_removed(loc.tier, tnode.in_memory);
+                    tnode.clear_storage_location();
+                }
+                notify_storage_commit(StorageMutation{
+                    StorageMutationKind::CapacityTrimCommitted,
+                    tctx.timestamp_ns,
+                    0,
+                    plan.ssd_trim_nodes.front(),
+                    span(plan.ssd_trim_nodes),
+                    Placement{plan.target_tier, 0},
+                    plan.target_tier,
+                    plan.ssd_trim_nodes.size() * config_.block_size_bytes,
+                });
+                add_counts(
+                    metrics_.foreground_capacity_evictions,
+                    plan.ssd_trim_nodes.size(),
+                    config_.block_size_bytes
+                );
+                for (NodeId trim_id : plan.ssd_trim_nodes) {
+                    if (tree_.contains(trim_id)) {
+                        prune_from(trim_id);
+                    }
+                }
+            }
+
+            ++metrics_.dump_requests;
+            StorageTierState& tier = storage_.tier(plan.target_tier);
+            if (!tier.has_free_blocks(plan.memory_nodes.size())) {
+                throw std::logic_error("JointCachePolicy exceeded destination tier capacity");
+            }
+            for (NodeId node_id : plan.memory_nodes) {
+                Node& node = tree_.node(node_id);
+                if (node.on_storage) {
+                    throw std::logic_error("JointCachePolicy attempted duplicate SSD write");
+                }
+                const StorageLocation location{
+                    plan.target_tier,
+                    tier.allocate(),
+                    plan.stream_id,
+                };
+                node.set_storage_location(location);
+                metrics_.storage_written(location.tier, node.in_memory);
+                metrics_.record_io(Operation::Write, location.tier, location.stream_id, true);
+                emit_io(tctx, node_id, Operation::Write, node, location, TraceReason::MemoryDump);
+            }
+            const std::uint64_t write_blocks = plan.memory_nodes.size();
+            const std::uint64_t write_bytes = write_blocks * config_.block_size_bytes;
+            notify_storage_commit(StorageMutation{
+                StorageMutationKind::DumpWriteCommitted,
+                tctx.timestamp_ns,
+                context.request.affinity_id,
+                plan.memory_nodes.back(),
+                span(plan.memory_nodes),
+                Placement{plan.target_tier, plan.stream_id},
+                plan.target_tier,
+                write_bytes,
+            });
+            add_counts(metrics_.dumps_admitted, write_blocks, config_.block_size_bytes);
+            add_counts(
+                metrics_.placements[storage_tier_index(plan.target_tier)],
+                write_blocks,
+                config_.block_size_bytes
+            );
+            ++metrics_.memory_dump_segments;
+            metrics_.memory_dump_blocks += write_blocks;
+        } else if (plan.kind == JointActionKind::Drop) {
+            ++metrics_.memory_drop_segments;
+            metrics_.memory_drop_blocks += plan.memory_nodes.size();
+        } else {
+            metrics_.memory_evictions_with_storage_copy += plan.memory_nodes.size();
+        }
+
+        ++metrics_.memory_evicted_segments;
+        metrics_.memory_evicted_blocks += plan.memory_nodes.size();
+        for (NodeId node_id : plan.memory_nodes) {
+            Node& victim = tree_.node(node_id);
+            metrics_.memory_removed(victim.on_storage);
+            victim.in_memory = false;
+            --memory_used_blocks_;
+            notify_memory_commit(MemoryMutation{MemoryMutationKind::Removed, node_id});
+        }
+        prune_segment(plan.memory_nodes);
+        return;
+    }
     const MemoryEvictionDecision decision = [&] {
         MemoryTimer timer(config_.profile_memory, memory_decision_ns);
         ++memory_decisions;
@@ -1057,12 +1259,16 @@ void Simulator::prune_from(NodeId node_id) {
 
         const NodeId removed_id = *current;
         const std::optional<NodeId> parent_id = tree_.detach_leaf(removed_id);
-        {
-            MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
-            memory_policy_->on_node_pruned(removed_id, parent_id, tree_);
-        }
-        if (!config_.infinite_storage) {
-            storage_policy_->on_node_pruned(removed_id, parent_id, storage_view());
+        if (joint_policy_) {
+            joint_policy_->on_node_pruned(removed_id, parent_id, tree_);
+        } else {
+            {
+                MemoryTimer timer(config_.profile_memory, memory_maintenance_ns);
+                memory_policy_->on_node_pruned(removed_id, parent_id, tree_);
+            }
+            if (!config_.infinite_storage) {
+                storage_policy_->on_node_pruned(removed_id, parent_id, storage_view());
+            }
         }
         ++metrics_.tree_nodes_removed;
         const std::vector<NodeId> removed{removed_id};
@@ -1089,7 +1295,11 @@ void Simulator::notify_storage_commit(const StorageMutation& mutation) {
             tree_.node(node_id).storage_last_access_timestamp_ns = mutation.timestamp_ns;
         }
     }
-    storage_policy_->on_commit(mutation, storage_view());
+    if (joint_policy_) {
+        joint_policy_->on_storage_commit(mutation, storage_view());
+    } else {
+        storage_policy_->on_commit(mutation, storage_view());
+    }
 }
 
 }  // namespace dwpdsim

@@ -11,6 +11,7 @@
 
 #include "dwpdsim/config.hpp"
 #include "dwpdsim/metrics.hpp"
+#include "dwpdsim/policies/joint/joint_cache_policy.hpp"
 #include "dwpdsim/policies/memory/memory_policy.hpp"
 #include "dwpdsim/policies/storage/storage_policy.hpp"
 #include "dwpdsim/radix_tree.hpp"
@@ -26,7 +27,8 @@ class Simulator {
         SimulationConfig config,
         std::unique_ptr<MemoryPolicy> memory_policy,
         std::unique_ptr<StoragePolicy> storage_policy,
-        const std::filesystem::path& trace_path
+        const std::filesystem::path& trace_path,
+        std::unique_ptr<JointCachePolicy> joint_policy = nullptr
     );
 
     void process_request(
@@ -53,8 +55,12 @@ class Simulator {
     const StorageState& storage() const noexcept;
     StoragePolicyStats storage_policy_stats() const;
     const ShadowFtl* shadow() const { return shadow_.get(); }
-    StoragePolicyWork storage_policy_work() const { return config_.infinite_storage ? StoragePolicyWork{} : storage_policy_->work(); }
-    MemoryPolicyWork memory_policy_work() const { return memory_policy_->work(); }
+    StoragePolicyWork storage_policy_work() const {
+        return (config_.infinite_storage || !storage_policy_) ? StoragePolicyWork{} : storage_policy_->work();
+    }
+    MemoryPolicyWork memory_policy_work() const {
+        return memory_policy_ ? memory_policy_->work() : MemoryPolicyWork{};
+    }
     std::uint64_t memory_decision_ns = 0;
     std::uint64_t memory_maintenance_ns = 0;
     std::uint64_t memory_decisions = 0;
@@ -128,6 +134,7 @@ class Simulator {
     StorageState storage_;
     std::unique_ptr<MemoryPolicy> memory_policy_;
     std::unique_ptr<StoragePolicy> storage_policy_;
+    std::unique_ptr<JointCachePolicy> joint_policy_;
     MetricsCollector metrics_;
     TraceWriter trace_writer_;
     std::ofstream memory_diagnostics_;
