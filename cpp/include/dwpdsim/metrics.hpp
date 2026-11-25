@@ -29,7 +29,7 @@ class MetricsCollector {
     explicit MetricsCollector(const SimulationConfig& config);
 
     void record_request(TimestampNs timestamp_ns) noexcept;
-    void record_access(AccessResult result) noexcept;
+    void record_access(AccessResult result, bool in_measurement = true) noexcept;
     void record_io(
         Operation operation,
         StorageTier tier,
@@ -48,6 +48,17 @@ class MetricsCollector {
     std::uint64_t tlc_hits = 0;
     std::uint64_t global_misses = 0;
     std::uint64_t compute_cost = 0;
+    std::uint64_t compute_cost_triangular = 0;
+
+    // Measurement-window access counters (for steady-state preconditioned replay).
+    std::uint64_t meas_request_count = 0;
+    std::uint64_t meas_block_access_count = 0;
+    std::uint64_t meas_memory_hits = 0;
+    std::uint64_t meas_slc_hits = 0;
+    std::uint64_t meas_tlc_hits = 0;
+    std::uint64_t meas_global_misses = 0;
+    std::uint64_t meas_compute_cost = 0;
+    std::uint64_t meas_compute_cost_triangular = 0;
 
     std::uint64_t storage_promotions = 0;
     std::uint64_t storage_bypasses = 0;

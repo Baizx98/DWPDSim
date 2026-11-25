@@ -6,6 +6,7 @@
 #include <set>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -38,6 +39,17 @@ struct EverglintJointPolicyConfig {
     double residence_ema_alpha = 0.05;
     double logical_fill_fraction = 1.0;
     double trim_gamma = 0.25;
+    // Fine-grained ablation, stability, promotion, and closed-loop control knobs
+    bool use_cadence_strata = true;
+    bool use_jensen_exact = true;
+    bool use_session_coherence = true;
+    bool use_smooth_sigmoid = true;
+    double session_hysteresis = 0.05;
+    std::uint64_t promote_hit_threshold = 0;
+    std::uint64_t gandalf_hash_salt = 47;
+    double target_life_years = 0.0;
+    double dual_step_kappa = 0.0;
+    std::uint64_t dual_window_ns = 900ULL * 1000000000ULL;
 };
 
 class EverglintJointPolicy final : public JointCachePolicy {
@@ -110,7 +122,8 @@ class EverglintJointPolicy final : public JointCachePolicy {
             double horizon,
             double residence_scale,
             double prior_p,
-            double prior_w
+            double prior_w,
+            bool jensen_exact
         ) const noexcept;
     };
 
@@ -156,6 +169,7 @@ class EverglintJointPolicy final : public JointCachePolicy {
     double region_budget_bytes(StorageTier tier, const StorageView& storage) const noexcept;
     double effective_waf(StorageTier tier, const StorageView& storage) const noexcept;
     double region_wear(StorageTier tier, const StorageView& storage) const noexcept;
+    double tier_minimax_weight(StorageTier tier, const StorageView& storage) const noexcept;
     double wear_potential(double rho_s, double rho_t) const noexcept;
     double marginal_wear(
         StorageTier tier,
@@ -167,8 +181,16 @@ class EverglintJointPolicy final : public JointCachePolicy {
         const StorageView& storage
     ) const noexcept;
     std::size_t session_stratum(AffinityId sid) const noexcept;
-    double survival_prob(const NodeMeta& meta, StorageTier tier) const noexcept;
-    double uniform_survival_prob(const NodeMeta& meta) const noexcept;
+    double effective_residence(StorageTier tier, const StorageView& storage) const noexcept;
+    double survival_prob(
+        const NodeMeta& meta,
+        StorageTier tier,
+        const StorageView& storage
+    ) const noexcept;
+    double uniform_survival_prob(
+        const NodeMeta& meta,
+        const StorageView& storage
+    ) const noexcept;
     std::pair<double, double> predict_node(const NodeMeta& meta) const noexcept;
     double block_recompute_cost(const NodeMeta& meta) const noexcept;
     std::uint64_t tier_capacity_limit(StorageTier tier, const StorageView& storage) const noexcept;
@@ -179,11 +201,24 @@ class EverglintJointPolicy final : public JointCachePolicy {
         const StorageView& storage
     ) const noexcept;
 
-    bool build_ssd_victims(
+    struct VictimChain {
+        std::vector<NodeId> nodes_bottom_up;
+        double loss_per_block = 0.0;
+        double total_loss = 0.0;
+        std::uint64_t recency = 0;
+    };
+
+    std::vector<VictimChain> collect_victim_candidates(
+        StorageTier tier,
+        const std::unordered_set<NodeId>& protected_set,
+        const StorageView& storage
+    ) const;
+
+    bool select_ssd_victims(
         StorageTier tier,
         std::uint64_t need_blocks,
-        NodeSpan protected_nodes,
-        const std::vector<NodeId>& moving_nodes,
+        const std::vector<VictimChain>& candidates,
+        const std::unordered_set<NodeId>& protected_set,
         const StorageView& storage,
         std::vector<NodeId>& out_victims,
         double& out_replacement_loss
@@ -196,6 +231,11 @@ class EverglintJointPolicy final : public JointCachePolicy {
     std::uint64_t current_req_seq_ = 0;
     AffinityId current_affinity_ = 0;
     double current_req_blocks_ = 1.0;
+
+    // Active lambda (equals config_.wear_lambda unless closed-loop dual control is active)
+    double active_wear_lambda_ = 1.0e8;
+    std::optional<TimestampNs> dual_window_start_ns_;
+    std::array<double, 2> dual_window_start_rho_{0.0, 0.0};
 
     std::array<ReturnHistogram, kNumStrata> histograms_;
     std::unordered_map<AffinityId, SessionState> sessions_;
@@ -211,8 +251,11 @@ class EverglintJointPolicy final : public JointCachePolicy {
     std::array<double, 2> est_nand_bytes_{0.0, 0.0};
     std::array<double, 2> residence_ema_{0.0, 0.0};
     std::array<std::uint64_t, 2> eviction_samples_{0, 0};
+    std::array<double, 2> write_blocks_per_req_ema_{0.0, 0.0};
+    std::array<std::uint64_t, 2> req_write_blocks_{0, 0};
     double global_residence_ema_ = 0.0;
     std::uint64_t global_eviction_samples_ = 0;
+    double global_write_blocks_per_req_ema_ = 0.0;
 };
 
 }  // namespace dwpdsim

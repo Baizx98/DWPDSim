@@ -32,6 +32,7 @@ class DWPDSimulator:
         core_config.slc = self._storage_tier_config(config.slc)
         core_config.tlc = self._storage_tier_config(config.tlc)
         core_config.simulation_end_ns = config.simulation_end_ns
+        core_config.measurement_start_ns = config.measurement_start_ns
         core_config.progress_interval_requests = config.progress_interval_requests
 
         core_config.profile_memory = config.memory_policy.profile
@@ -113,6 +114,16 @@ class DWPDSimulator:
             everglint_prior_weight=storage.everglint_prior_weight,
             everglint_residence_ema_alpha=storage.everglint_residence_ema_alpha,
             everglint_trim_gamma=storage.everglint_trim_gamma,
+            everglint_use_cadence_strata=storage.everglint_use_cadence_strata,
+            everglint_use_jensen_exact=storage.everglint_use_jensen_exact,
+            everglint_use_session_coherence=storage.everglint_use_session_coherence,
+            everglint_use_smooth_sigmoid=storage.everglint_use_smooth_sigmoid,
+            everglint_session_hysteresis=storage.everglint_session_hysteresis,
+            everglint_promote_hit_threshold=storage.everglint_promote_hit_threshold,
+            everglint_gandalf_hash_salt=storage.everglint_gandalf_hash_salt,
+            everglint_target_life_years=storage.everglint_target_life_years,
+            everglint_dual_step_kappa=storage.everglint_dual_step_kappa,
+            everglint_dual_window_ns=storage.everglint_dual_window_ns,
         )
         self._processed_requests = 0
         self._next_progress_request = config.progress_interval_requests

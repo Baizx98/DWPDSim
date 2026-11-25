@@ -371,6 +371,7 @@ PYBIND11_MODULE(_core, module) {
         .def_readwrite("slc", &SimulationConfig::slc)
         .def_readwrite("tlc", &SimulationConfig::tlc)
         .def_readwrite("simulation_end_ns", &SimulationConfig::simulation_end_ns)
+        .def_readwrite("measurement_start_ns", &SimulationConfig::measurement_start_ns)
         .def_readwrite(
             "progress_interval_requests",
             &SimulationConfig::progress_interval_requests
@@ -444,7 +445,17 @@ PYBIND11_MODULE(_core, module) {
                          double everglint_prior_reuse_prob,
                          double everglint_prior_weight,
                          double everglint_residence_ema_alpha,
-                         double everglint_trim_gamma
+                         double everglint_trim_gamma,
+                         bool everglint_use_cadence_strata,
+                         bool everglint_use_jensen_exact,
+                         bool everglint_use_session_coherence,
+                         bool everglint_use_smooth_sigmoid,
+                         double everglint_session_hysteresis,
+                         std::uint64_t everglint_promote_hit_threshold,
+                         std::uint64_t everglint_gandalf_hash_salt,
+                         double everglint_target_life_years,
+                         double everglint_dual_step_kappa,
+                         std::uint64_t everglint_dual_window_ns
                      ) {
                 if (storage_policy == "everglint_joint") {
                     const EverglintJointPolicyConfig joint_cfg{
@@ -471,6 +482,16 @@ PYBIND11_MODULE(_core, module) {
                         everglint_residence_ema_alpha,
                         logical_fill_fraction,
                         everglint_trim_gamma,
+                        everglint_use_cadence_strata,
+                        everglint_use_jensen_exact,
+                        everglint_use_session_coherence,
+                        everglint_use_smooth_sigmoid,
+                        everglint_session_hysteresis,
+                        everglint_promote_hit_threshold,
+                        everglint_gandalf_hash_salt,
+                        everglint_target_life_years,
+                        everglint_dual_step_kappa,
+                        everglint_dual_window_ns,
                     };
                     return std::make_unique<Simulator>(
                         std::move(config),
@@ -641,7 +662,17 @@ PYBIND11_MODULE(_core, module) {
             py::arg("everglint_prior_reuse_prob") = 0.5,
             py::arg("everglint_prior_weight") = 10.0,
             py::arg("everglint_residence_ema_alpha") = 0.05,
-            py::arg("everglint_trim_gamma") = 0.25
+            py::arg("everglint_trim_gamma") = 0.25,
+            py::arg("everglint_use_cadence_strata") = true,
+            py::arg("everglint_use_jensen_exact") = true,
+            py::arg("everglint_use_session_coherence") = true,
+            py::arg("everglint_use_smooth_sigmoid") = true,
+            py::arg("everglint_session_hysteresis") = 0.05,
+            py::arg("everglint_promote_hit_threshold") = 0ULL,
+            py::arg("everglint_gandalf_hash_salt") = 47ULL,
+            py::arg("everglint_target_life_years") = 0.0,
+            py::arg("everglint_dual_step_kappa") = 0.0,
+            py::arg("everglint_dual_window_ns") = 900000000000ULL
         )
         .def("storage_performance", [](const Simulator& simulator) {
             py::dict result;
@@ -673,6 +704,27 @@ PYBIND11_MODULE(_core, module) {
             result["indexed_segments"] = work.indexed_segments;
             result["indexed_residents"] = work.indexed_residents;
             result["ancestor_entries"] = work.ancestor_entries;
+            return result;
+        })
+        .def("extended_access_stats", [](const Simulator& simulator) {
+            const MetricsCollector& metrics = simulator.metrics();
+            const std::uint64_t meas_storage_hits = metrics.meas_slc_hits + metrics.meas_tlc_hits;
+            const std::uint64_t meas_all_hits = metrics.meas_memory_hits + meas_storage_hits;
+            py::dict result;
+            result["compute_cost"] = metrics.compute_cost;
+            result["compute_cost_triangular"] = metrics.compute_cost_triangular;
+            py::dict mw;
+            mw["requests"] = metrics.meas_request_count;
+            mw["total"] = metrics.meas_block_access_count;
+            mw["memory_hits"] = metrics.meas_memory_hits;
+            mw["slc_hits"] = metrics.meas_slc_hits;
+            mw["tlc_hits"] = metrics.meas_tlc_hits;
+            mw["global_misses"] = metrics.meas_global_misses;
+            mw["compute_cost"] = metrics.meas_compute_cost;
+            mw["compute_cost_triangular"] = metrics.meas_compute_cost_triangular;
+            mw["memory_hit_rate"] = rate(metrics.meas_memory_hits, metrics.meas_block_access_count);
+            mw["total_hit_rate"] = rate(meas_all_hits, metrics.meas_block_access_count);
+            result["measurement_window"] = std::move(mw);
             return result;
         })
         .def(

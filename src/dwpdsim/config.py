@@ -101,6 +101,16 @@ class StoragePolicyConfig:
     everglint_prior_weight: float = 10.0
     everglint_residence_ema_alpha: float = 0.05
     everglint_trim_gamma: float = 0.25
+    everglint_use_cadence_strata: bool = True
+    everglint_use_jensen_exact: bool = True
+    everglint_use_session_coherence: bool = True
+    everglint_use_smooth_sigmoid: bool = True
+    everglint_session_hysteresis: float = 0.05
+    everglint_promote_hit_threshold: int = 0
+    everglint_gandalf_hash_salt: int = 47
+    everglint_target_life_years: float = 0.0
+    everglint_dual_step_kappa: float = 0.0
+    everglint_dual_window_ns: int = 900 * 1_000_000_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,4 +124,5 @@ class SimulationConfig:
     memory_policy: MemoryPolicyConfig = field(default_factory=MemoryPolicyConfig)
     storage_policy: StoragePolicyConfig = field(default_factory=StoragePolicyConfig)
     simulation_end_ns: int | None = None
+    measurement_start_ns: int = 0
     progress_interval_requests: int = 0

@@ -22,6 +22,7 @@ struct SimulationConfig {
     StorageTierConfig slc{};
     StorageTierConfig tlc{};
     std::optional<TimestampNs> simulation_end_ns;
+    std::uint64_t measurement_start_ns = 0;
     std::uint64_t progress_interval_requests = 0;
     bool profile_memory = false;
     bool infinite_storage = false;

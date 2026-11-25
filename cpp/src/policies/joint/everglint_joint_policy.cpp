@@ -75,7 +75,8 @@ double EverglintJointPolicy::ReturnHistogram::predict_survival(
     double horizon,
     double residence_scale,
     double prior_p,
-    double prior_w
+    double prior_w,
+    bool jensen_exact
 ) const noexcept {
     if (residence_scale <= 0.0) {
         return 1.0;
@@ -83,6 +84,12 @@ double EverglintJointPolicy::ReturnHistogram::predict_survival(
     const double age = std::max(0.0, idle_age);
     if (age >= horizon) {
         return std::exp(-horizon / residence_scale);
+    }
+    if (!jensen_exact) {
+        // Plug-in conditional mean approximation exp(-E[T - a | T >= a] / L_k)
+        const auto [p_unused, tau] = predict(age, horizon, prior_p, prior_w);
+        static_cast<void>(p_unused);
+        return std::clamp(std::exp(-tau / residence_scale), 0.0, 1.0);
     }
     const std::size_t start_b = age <= 0.0 ? 0 : bucket_for(age);
     double ret_ge = 0.0;
@@ -131,7 +138,9 @@ std::uint64_t EverglintJointPolicy::stable_hash(
 }
 
 EverglintJointPolicy::EverglintJointPolicy(EverglintJointPolicyConfig config)
-    : config_(std::move(config)), mode_(parse_mode(config_.mode)) {
+    : config_(std::move(config)),
+      mode_(parse_mode(config_.mode)),
+      active_wear_lambda_(config_.wear_lambda) {
     if (!std::isfinite(config_.wear_lambda) || config_.wear_lambda < 0.0) {
         throw std::invalid_argument("wear_lambda must be finite and nonnegative");
     }
@@ -151,12 +160,19 @@ EverglintJointPolicy::EverglintJointPolicy(EverglintJointPolicyConfig config)
     if (config_.logical_fill_fraction <= 0.0 || config_.logical_fill_fraction > 1.0) {
         throw std::invalid_argument("logical_fill_fraction must be in (0, 1]");
     }
+    if (!std::isfinite(config_.session_hysteresis) || config_.session_hysteresis < 0.0 ||
+        config_.session_hysteresis >= 0.5) {
+        throw std::invalid_argument("session_hysteresis must be in [0, 0.5)");
+    }
     for (auto& hist : histograms_) {
         hist.init(static_cast<double>(config_.horizon_requests));
     }
 }
 
 std::size_t EverglintJointPolicy::session_stratum(AffinityId sid) const noexcept {
+    if (!config_.use_cadence_strata) {
+        return 0;
+    }
     const auto it = sessions_.find(sid);
     if (it == sessions_.end() || it->second.req_count < 2 || it->second.ema_gap <= 0.0) {
         return 0;
@@ -176,17 +192,69 @@ void EverglintJointPolicy::bind_tree(const RadixTree& tree) {
 }
 
 bool EverglintJointPolicy::admit_storage_hit(
-    const AccessContext&,
+    const AccessContext& access,
     const Node&,
     const RadixTree&
 ) const {
-    return config_.admit_storage_hits;
+    if (config_.admit_storage_hits) {
+        return true;
+    }
+    if (config_.promote_hit_threshold > 0) {
+        const auto it = nodes_.find(access.node_id);
+        if (it != nodes_.end() && (it->second.reuse_count + 1) >= config_.promote_hit_threshold) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void EverglintJointPolicy::on_request_begin(
     const RequestContext& request,
-    const StorageView&
+    const StorageView& storage
 ) {
+    // Update Little's Law per-request write-rate EMA from previous request.
+    if (current_req_seq_ > 0) {
+        constexpr double rate_alpha = 0.01;
+        const double total_w = static_cast<double>(req_write_blocks_[0] + req_write_blocks_[1]);
+        for (std::size_t t = 0; t < 2; ++t) {
+            const double w = static_cast<double>(req_write_blocks_[t]);
+            write_blocks_per_req_ema_[t] =
+                (1.0 - rate_alpha) * write_blocks_per_req_ema_[t] + rate_alpha * w;
+            req_write_blocks_[t] = 0;
+        }
+        global_write_blocks_per_req_ema_ =
+            (1.0 - rate_alpha) * global_write_blocks_per_req_ema_ + rate_alpha * total_w;
+    }
+
+    // Optional closed-loop target-lifetime primal-dual lambda controller.
+    if (config_.target_life_years > 0.0 && config_.dual_step_kappa > 0.0 &&
+        config_.dual_window_ns > 0) {
+        const double rho_s = region_wear(StorageTier::Slc, storage);
+        const double rho_t = region_wear(StorageTier::Tlc, storage);
+        if (!dual_window_start_ns_.has_value()) {
+            dual_window_start_ns_ = request.timestamp_ns;
+            dual_window_start_rho_ = {rho_s, rho_t};
+        } else if (request.timestamp_ns >= *dual_window_start_ns_ + config_.dual_window_ns) {
+            const double dt_ns = static_cast<double>(request.timestamp_ns - *dual_window_start_ns_);
+            constexpr double year_ns = 365.0 * 86400.0 * 1.0e9;
+            const double dt_years = dt_ns / year_ns;
+            if (dt_years > 0.0) {
+                const double d_rho_s = std::max(0.0, rho_s - dual_window_start_rho_[0]);
+                const double d_rho_t = std::max(0.0, rho_t - dual_window_start_rho_[1]);
+                const double obs_rate = std::max(d_rho_s, d_rho_t) / dt_years;
+                const double target_rate = 1.0 / config_.target_life_years;
+                const double rel_err = std::clamp(obs_rate / target_rate - 1.0, -1.0, 1.0);
+                active_wear_lambda_ = std::clamp(
+                    active_wear_lambda_ * std::exp(config_.dual_step_kappa * rel_err),
+                    1.0e9,
+                    3.0e11
+                );
+            }
+            dual_window_start_ns_ = request.timestamp_ns;
+            dual_window_start_rho_ = {rho_s, rho_t};
+        }
+    }
+
     ++current_req_seq_;
     current_affinity_ = request.affinity_id == 0 ? request.request_id : request.affinity_id;
     current_req_blocks_ = std::max<double>(1.0, static_cast<double>(request.ordered_hashes.size));
@@ -395,11 +463,13 @@ void EverglintJointPolicy::on_storage_commit(
             const double waf = effective_waf(mutation.placement.tier, storage_after_commit);
             program_bytes_[t] += mutation.bytes;
             est_nand_bytes_[t] += waf * static_cast<double>(mutation.bytes);
+            req_write_blocks_[t] += mutation.nodes.size;
             if (!mutation.nodes.empty()) {
                 const auto nit = nodes_.find(mutation.nodes[0]);
                 if (nit != nodes_.end() && nit->second.session_id != 0) {
                     auto sit = sessions_.find(nit->second.session_id);
-                    if (sit != sessions_.end() && !sit->second.preferred_tier.has_value()) {
+                    if (sit != sessions_.end()) {
+                        // Update soft preferred tier to most recent placement (no permanent hard lock).
                         sit->second.preferred_tier = mutation.placement.tier;
                     }
                 }
@@ -414,12 +484,13 @@ void EverglintJointPolicy::on_storage_commit(
             }
             break;
         }
-        case StorageMutationKind::CapacityTrimCommitted: {
+        case StorageMutationKind::CapacityTrimCommitted:
+        case StorageMutationKind::IdleTrimCommitted: {
             const std::size_t t = storage_tier_index(mutation.source_tier);
             const double alpha = config_.residence_ema_alpha;
             for (NodeId id : mutation.nodes) {
                 auto it = nodes_.find(id);
-                if (it != nodes_.end()) {
+                if (it != nodes_.end() && it->second.write_req_seq > 0) {
                     const double res_age = std::max(
                         1.0,
                         static_cast<double>(current_req_seq_ - it->second.write_req_seq)
@@ -438,13 +509,6 @@ void EverglintJointPolicy::on_storage_commit(
                     }
                     ++global_eviction_samples_;
                 }
-                refresh_node_sets(id, tree);
-                refresh_children_root_membership(id, tree);
-            }
-            break;
-        }
-        case StorageMutationKind::IdleTrimCommitted: {
-            for (NodeId id : mutation.nodes) {
                 refresh_node_sets(id, tree);
                 refresh_children_root_membership(id, tree);
             }
@@ -526,6 +590,27 @@ double EverglintJointPolicy::region_wear(
     return budget > 0.0 ? est_nand_bytes_[idx] / budget : 0.0;
 }
 
+double EverglintJointPolicy::tier_minimax_weight(
+    StorageTier tier,
+    const StorageView& storage
+) const noexcept {
+    const double rho_s = region_wear(StorageTier::Slc, storage);
+    const double rho_t = region_wear(StorageTier::Tlc, storage);
+    const double diff = (tier == StorageTier::Slc) ? (rho_s - rho_t) : (rho_t - rho_s);
+    if (!config_.use_smooth_sigmoid) {
+        if (diff > 0.0) {
+            return 1.0;
+        }
+        if (diff < 0.0) {
+            return 0.0;
+        }
+        return 0.5;
+    }
+    const double total = rho_s + rho_t;
+    const double z = total > 1e-15 ? std::clamp(6.0 * diff / total, -12.0, 12.0) : 0.0;
+    return 1.0 / (1.0 + std::exp(-z));
+}
+
 double EverglintJointPolicy::wear_potential(double rho_s, double rho_t) const noexcept {
     return std::max(rho_s, rho_t) + config_.wear_eta * (rho_s + rho_t);
 }
@@ -539,19 +624,14 @@ double EverglintJointPolicy::marginal_wear(
     const double rho_t = region_wear(StorageTier::Tlc, storage);
     const double waf = effective_waf(tier, storage);
     const double delta = (waf * static_cast<double>(write_bytes)) / region_budget_bytes(tier, storage);
-    if (config_.wear_eta <= 0.0) {
-        // Exact hard minimax for NoEta ablation.
+    if (!config_.use_smooth_sigmoid) {
+        // Exact hard minimax finite difference (decoupled from wear_eta).
         const double next = tier == StorageTier::Slc
                                 ? wear_potential(rho_s + delta, rho_t)
                                 : wear_potential(rho_s, rho_t + delta);
         return next - wear_potential(rho_s, rho_t);
     }
-    // Scale-invariant smooth minimax gradient: avoids 11x step-kink oscillation at rho_S == rho_T
-    // while smoothly steering writes away from whichever tier pulls ahead in normalized wear.
-    const double total = rho_s + rho_t;
-    const double diff = (tier == StorageTier::Slc) ? (rho_s - rho_t) : (rho_t - rho_s);
-    const double z = total > 1e-15 ? std::clamp(6.0 * diff / total, -12.0, 12.0) : 0.0;
-    const double minimax_weight = 1.0 / (1.0 + std::exp(-z));
+    const double minimax_weight = tier_minimax_weight(tier, storage);
     return (minimax_weight + config_.wear_eta) * delta;
 }
 
@@ -578,15 +658,37 @@ double EverglintJointPolicy::uniform_marginal_wear(
     return (1.0 + 2.0 * config_.wear_eta) * (static_cast<double>(write_bytes) / total_budget);
 }
 
+double EverglintJointPolicy::effective_residence(
+    StorageTier tier,
+    const StorageView& storage
+) const noexcept {
+    const std::size_t idx = storage_tier_index(tier);
+    const double cap = static_cast<double>(storage.storage().tier(tier).capacity_blocks());
+    const double rate = write_blocks_per_req_ema_[idx];
+    const double little_res =
+        rate > 1e-4 ? std::min(static_cast<double>(config_.horizon_requests) * 2.0, cap / rate)
+                    : 0.0;
+    if (eviction_samples_[idx] == 0 || residence_ema_[idx] <= 0.0) {
+        return little_res;
+    }
+    if (little_res <= 0.0) {
+        return residence_ema_[idx];
+    }
+    // Anchor observed eviction/TRIM residence EMA with Little's Law capacity turnover scale
+    // so proactive TRIM never freezes residence_ema_ at stale cold-start values.
+    return std::clamp(residence_ema_[idx], 0.5 * little_res, 2.0 * little_res);
+}
+
 double EverglintJointPolicy::survival_prob(
     const NodeMeta& meta,
-    StorageTier tier
+    StorageTier tier,
+    const StorageView& storage
 ) const noexcept {
     if (!config_.use_survival) {
         return 1.0;
     }
-    const std::size_t idx = storage_tier_index(tier);
-    if (eviction_samples_[idx] == 0 || residence_ema_[idx] <= 0.0) {
+    const double res = effective_residence(tier, storage);
+    if (res <= 0.0) {
         return 1.0;
     }
     const double idle_age =
@@ -597,17 +699,36 @@ double EverglintJointPolicy::survival_prob(
     return histograms_[hist_idx].predict_survival(
         idle_age,
         static_cast<double>(config_.horizon_requests),
-        residence_ema_[idx],
+        res,
         config_.prior_reuse_prob,
-        config_.prior_weight
+        config_.prior_weight,
+        config_.use_jensen_exact
     );
 }
 
-double EverglintJointPolicy::uniform_survival_prob(const NodeMeta& meta) const noexcept {
+double EverglintJointPolicy::uniform_survival_prob(
+    const NodeMeta& meta,
+    const StorageView& storage
+) const noexcept {
     if (!config_.use_survival) {
         return 1.0;
     }
-    if (global_eviction_samples_ == 0 || global_residence_ema_ <= 0.0) {
+    const double total_cap = static_cast<double>(
+        storage.storage().tier(StorageTier::Slc).capacity_blocks() +
+        storage.storage().tier(StorageTier::Tlc).capacity_blocks()
+    );
+    const double little_global =
+        global_write_blocks_per_req_ema_ > 1e-4
+            ? std::min(static_cast<double>(config_.horizon_requests) * 2.0,
+                       total_cap / global_write_blocks_per_req_ema_)
+            : 0.0;
+    double res = global_residence_ema_;
+    if (global_eviction_samples_ == 0 || res <= 0.0) {
+        res = little_global;
+    } else if (little_global > 0.0) {
+        res = std::clamp(res, 0.5 * little_global, 2.0 * little_global);
+    }
+    if (res <= 0.0) {
         return 1.0;
     }
     const double idle_age =
@@ -618,9 +739,10 @@ double EverglintJointPolicy::uniform_survival_prob(const NodeMeta& meta) const n
     return histograms_[hist_idx].predict_survival(
         idle_age,
         static_cast<double>(config_.horizon_requests),
-        global_residence_ema_,
+        res,
         config_.prior_reuse_prob,
-        config_.prior_weight
+        config_.prior_weight,
+        config_.use_jensen_exact
     );
 }
 
@@ -677,56 +799,34 @@ std::uint32_t EverglintJointPolicy::stream_for(
     return static_cast<std::uint32_t>(stable_hash(key, 29) % count);
 }
 
-bool EverglintJointPolicy::build_ssd_victims(
+std::vector<EverglintJointPolicy::VictimChain>
+EverglintJointPolicy::collect_victim_candidates(
     StorageTier tier,
-    std::uint64_t need_blocks,
-    NodeSpan protected_nodes,
-    const std::vector<NodeId>& moving_nodes,
-    const StorageView& storage,
-    std::vector<NodeId>& out_victims,
-    double& out_replacement_loss
+    const std::unordered_set<NodeId>& protected_set,
+    const StorageView& storage
 ) const {
-    out_victims.clear();
-    out_replacement_loss = 0.0;
-    if (need_blocks == 0) {
-        return true;
-    }
-
     const RadixTree& tree = storage.tree();
-    std::unordered_set<NodeId> forbidden(protected_nodes.begin(), protected_nodes.end());
-    forbidden.insert(moving_nodes.begin(), moving_nodes.end());
-
-    struct VictimChain {
-        std::vector<NodeId> nodes_bottom_up;
-        double loss_per_block = 0.0;
-        double total_loss = 0.0;
-        std::uint64_t recency = 0;
-    };
-
     const auto& leaf_set = ssd_leaf_set_[storage_tier_index(tier)];
     std::vector<VictimChain> candidates;
     candidates.reserve(std::min<std::size_t>(leaf_set.size(), config_.victim_limit));
 
     std::size_t scanned = 0;
     for (const auto& [recency, leaf_id] : leaf_set) {
-        if (scanned >= config_.victim_limit && candidates.size() >= need_blocks) {
+        if (scanned >= config_.victim_limit) {
             break;
         }
         ++scanned;
-        if (forbidden.count(leaf_id) || !tree.contains(leaf_id)) {
+        if (protected_set.count(leaf_id) || !tree.contains(leaf_id)) {
             continue;
         }
 
-        // Walk up a single-child same-tier SSD chain (bounded by max(chunk_blocks, need_blocks)).
         VictimChain chain;
         chain.recency = recency;
-        const std::size_t max_len = static_cast<std::size_t>(
-            std::max(config_.chunk_blocks, need_blocks)
-        );
+        const std::size_t max_len = static_cast<std::size_t>(config_.chunk_blocks);
         std::optional<NodeId> cur = leaf_id;
         double chain_loss = 0.0;
         while (cur.has_value() && chain.nodes_bottom_up.size() < max_len) {
-            if (forbidden.count(*cur) || !tree.contains(*cur)) {
+            if (protected_set.count(*cur) || !tree.contains(*cur)) {
                 break;
             }
             const Node& node = tree.node(*cur);
@@ -743,8 +843,8 @@ bool EverglintJointPolicy::build_ssd_victims(
             const auto [p_e, tau_e] = predict_node(mit->second);
             static_cast<void>(tau_e);
             const double q_e = (mode_ == Mode::Everglint)
-                                   ? survival_prob(mit->second, tier)
-                                   : uniform_survival_prob(mit->second);
+                                   ? survival_prob(mit->second, tier, storage)
+                                   : uniform_survival_prob(mit->second, storage);
             const double c_e = block_recompute_cost(mit->second);
             chain_loss += p_e * q_e * c_e;
             chain.nodes_bottom_up.push_back(*cur);
@@ -770,14 +870,47 @@ bool EverglintJointPolicy::build_ssd_victims(
             }
         );
     }
+    return candidates;
+}
 
-    // Trim whole selected victim chains (up to chunk_blocks) so contiguous session blocks
-    // invalidate cleanly together and minimize flash erase-block fragmentation (WAF).
+bool EverglintJointPolicy::select_ssd_victims(
+    StorageTier tier,
+    std::uint64_t need_blocks,
+    const std::vector<VictimChain>& candidates,
+    const std::unordered_set<NodeId>& protected_set,
+    const StorageView& storage,
+    std::vector<NodeId>& out_victims,
+    double& out_replacement_loss
+) const {
+    out_victims.clear();
+    out_replacement_loss = 0.0;
+    if (need_blocks == 0) {
+        return true;
+    }
+
+    const RadixTree& tree = storage.tree();
     std::unordered_set<NodeId> selected;
     std::uint64_t freed = 0;
     for (const auto& chain : candidates) {
         if (freed >= need_blocks) {
             break;
+        }
+        // Whole-chain fast path when no overlap with already-selected nodes
+        bool clean_chain = true;
+        for (NodeId id : chain.nodes_bottom_up) {
+            if (selected.count(id)) {
+                clean_chain = false;
+                break;
+            }
+        }
+        if (clean_chain) {
+            for (NodeId id : chain.nodes_bottom_up) {
+                selected.insert(id);
+                out_victims.push_back(id);
+            }
+            out_replacement_loss += chain.total_loss;
+            freed += chain.nodes_bottom_up.size();
+            continue;
         }
         for (NodeId id : chain.nodes_bottom_up) {
             if (!selected.insert(id).second) {
@@ -787,17 +920,16 @@ bool EverglintJointPolicy::build_ssd_victims(
             const auto [p_e, tau_e] = predict_node(meta);
             static_cast<void>(tau_e);
             const double q_e = (mode_ == Mode::Everglint)
-                                   ? survival_prob(meta, tier)
-                                   : uniform_survival_prob(meta);
-            const double c_e = block_recompute_cost(meta);
-            out_replacement_loss += p_e * q_e * c_e;
+                                   ? survival_prob(meta, tier, storage)
+                                   : uniform_survival_prob(meta, storage);
+            out_replacement_loss += p_e * q_e * block_recompute_cost(meta);
             out_victims.push_back(id);
             ++freed;
         }
     }
 
     if (freed < need_blocks) {
-        // Scan remaining leaves beyond victim_limit if capacity is severely constrained.
+        const auto& leaf_set = ssd_leaf_set_[storage_tier_index(tier)];
         std::size_t idx = 0;
         for (const auto& [recency, leaf_id] : leaf_set) {
             ++idx;
@@ -807,12 +939,12 @@ bool EverglintJointPolicy::build_ssd_victims(
             if (freed >= need_blocks) {
                 break;
             }
-            if (forbidden.count(leaf_id) || selected.count(leaf_id) || !tree.contains(leaf_id)) {
+            if (protected_set.count(leaf_id) || selected.count(leaf_id) || !tree.contains(leaf_id)) {
                 continue;
             }
             std::optional<NodeId> cur = leaf_id;
             while (cur.has_value() && freed < need_blocks) {
-                if (forbidden.count(*cur) || selected.count(*cur) || !tree.contains(*cur)) {
+                if (protected_set.count(*cur) || selected.count(*cur) || !tree.contains(*cur)) {
                     break;
                 }
                 const Node& node = tree.node(*cur);
@@ -827,8 +959,8 @@ bool EverglintJointPolicy::build_ssd_victims(
                 const auto [p_e, tau_e] = predict_node(mit->second);
                 static_cast<void>(tau_e);
                 const double q_e = (mode_ == Mode::Everglint)
-                                       ? survival_prob(mit->second, tier)
-                                       : uniform_survival_prob(mit->second);
+                                       ? survival_prob(mit->second, tier, storage)
+                                       : uniform_survival_prob(mit->second, storage);
                 out_replacement_loss += p_e * q_e * block_recompute_cost(mit->second);
                 out_victims.push_back(*cur);
                 ++freed;
@@ -884,7 +1016,6 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
             }
             ++scanned;
 
-            // Walk up a single-child DRAM-only chain up to chunk_blocks.
             std::vector<NodeId> chunk_bottom_up;
             std::optional<NodeId> cur = leaf_id;
             double total_loss = 0.0;
@@ -904,6 +1035,7 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
                     break;
                 }
                 const auto [p_i, tau_i] = predict_node(mit->second);
+                static_cast<void>(tau_i);
                 const double c_i = block_recompute_cost(mit->second);
                 total_loss += p_i * c_i;
                 chunk_bottom_up.push_back(*cur);
@@ -925,6 +1057,18 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
     }
 
     // 3. Evaluate legal DRAM root-side Move-to-SLC and Move-to-TLC candidates.
+    // Pre-compute sorted SSD victim candidate chains ONCE per tier (disjoint from DRAM-only moving nodes).
+    std::array<std::vector<VictimChain>, 2> tier_victim_candidates;
+    std::array<bool, 2> tier_candidates_ready{false, false};
+    auto get_tier_candidates = [&](StorageTier tier) -> const std::vector<VictimChain>& {
+        const std::size_t idx = storage_tier_index(tier);
+        if (!tier_candidates_ready[idx]) {
+            tier_victim_candidates[idx] = collect_victim_candidates(tier, protected_set, storage);
+            tier_candidates_ready[idx] = true;
+        }
+        return tier_victim_candidates[idx];
+    };
+
     const std::uint64_t block_size = storage.block_size_bytes();
     const double slc_b = region_budget_bytes(StorageTier::Slc, storage);
     const double tlc_b = region_budget_bytes(StorageTier::Tlc, storage);
@@ -940,7 +1084,6 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
         }
         ++scanned_roots;
 
-        // Walk top-down along a single-child DRAM-only chain up to chunk_blocks.
         std::vector<NodeId> chunk_top_down;
         std::optional<NodeId> cur = root_id;
         std::vector<NodeId> children;
@@ -971,10 +1114,6 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
         const std::uint64_t write_bytes = m * block_size;
         const auto& root_meta = nodes_.at(root_id);
 
-        // Determine candidate destination tiers according to mode.
-        // Session-coherent & Prefix-Monotonic placement for Everglint: keep chunks of the same
-        // session co-located on one tier (preventing tier-inversion pinning and flash-block
-        // lifetime mixing), falling back if the preferred tier cannot free space.
         const auto parent_opt = tree.parent(root_id);
         const bool parent_on_ssd =
             parent_opt.has_value() && tree.contains(*parent_opt) &&
@@ -983,7 +1122,7 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
             parent_on_ssd && tree.node(*parent_opt).storage_tier == StorageTier::Slc;
 
         std::optional<StorageTier> session_tier;
-        if (root_meta.session_id != 0) {
+        if (config_.use_session_coherence && root_meta.session_id != 0) {
             const auto sit = sessions_.find(root_meta.session_id);
             if (sit != sessions_.end()) {
                 session_tier = sit->second.preferred_tier;
@@ -993,18 +1132,15 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
         std::vector<StorageTier> candidate_tiers;
         bool stop_after_first_feasible = false;
         if (mode_ == Mode::Everglint) {
-            if (parent_in_slc) {
+            if (config_.use_session_coherence && parent_in_slc) {
+                // Hard prefix-monotonicity: children of an SLC prefix never pin SLC from TLC.
                 candidate_tiers = config_.allow_drop
                                       ? std::vector<StorageTier>{StorageTier::Slc}
                                       : std::vector<StorageTier>{StorageTier::Slc, StorageTier::Tlc};
                 stop_after_first_feasible = true;
-            } else if (session_tier.has_value()) {
-                const StorageTier pref = *session_tier;
-                const StorageTier alt =
-                    pref == StorageTier::Slc ? StorageTier::Tlc : StorageTier::Slc;
-                candidate_tiers = {pref, alt};
-                stop_after_first_feasible = true;
             } else {
+                // Soft session hysteresis: ALWAYS evaluate BOTH SLC and TLC so smooth minimax
+                // continuously rebalances regional wear across long sessions.
                 candidate_tiers = {StorageTier::Slc, StorageTier::Tlc};
             }
         } else if (mode_ == Mode::GandalfTlc) {
@@ -1012,12 +1148,12 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
         } else if (mode_ == Mode::GandalfSlc) {
             candidate_tiers = {StorageTier::Slc};
         } else {
-            // Gandalf-WearShare: pick tier by endurance-proportional affinity hash.
+            // Gandalf-WearShare: endurance-proportional affinity hash with configurable salt.
             const std::uint64_t key =
                 root_meta.session_id == 0 ? root_id : root_meta.session_id;
             constexpr std::uint64_t mask = (1ULL << 53) - 1;
             const double draw =
-                static_cast<double>(stable_hash(key, 47) & mask) /
+                static_cast<double>(stable_hash(key, config_.gandalf_hash_salt) & mask) /
                 static_cast<double>(1ULL << 53);
             const StorageTier primary =
                 draw < slc_target_share ? StorageTier::Slc : StorageTier::Tlc;
@@ -1036,11 +1172,11 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
 
             std::vector<NodeId> victims;
             double replacement_loss = 0.0;
-            if (!build_ssd_victims(
+            if (need > 0 && !select_ssd_victims(
                     tier,
                     need,
-                    context.request.protected_prefix,
-                    chunk_top_down,
+                    get_tier_candidates(tier),
+                    protected_set,
                     storage,
                     victims,
                     replacement_loss
@@ -1054,16 +1190,20 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
                 const auto [p_i, tau_i] = predict_node(meta);
                 static_cast<void>(tau_i);
                 const double q_ik = (mode_ == Mode::Everglint)
-                                        ? survival_prob(meta, tier)
-                                        : uniform_survival_prob(meta);
+                                        ? survival_prob(meta, tier, storage)
+                                        : uniform_survival_prob(meta, storage);
                 const double c_i = block_recompute_cost(meta);
                 early_evict_loss += p_i * (1.0 - q_ik) * c_i;
             }
 
-            const double wear_cost =
-                config_.wear_lambda *
+            double wear_cost =
+                active_wear_lambda_ *
                 ((mode_ == Mode::Everglint) ? marginal_wear(tier, write_bytes, storage)
                                             : uniform_marginal_wear(write_bytes, storage));
+            if (mode_ == Mode::Everglint && config_.use_session_coherence &&
+                session_tier.has_value() && *session_tier == tier) {
+                wear_cost *= (1.0 - config_.session_hysteresis);
+            }
             const double total_loss = early_evict_loss + wear_cost + replacement_loss;
             const double loss_per_block = total_loss / static_cast<double>(m);
 
@@ -1080,7 +1220,6 @@ JointEvictionPlan EverglintJointPolicy::plan_eviction(
             }
 
             if (mode_ == Mode::GandalfWearShare || stop_after_first_feasible) {
-                // Only use fallback tier if primary tier was infeasible.
                 break;
             }
         }
@@ -1123,10 +1262,9 @@ std::vector<std::pair<StorageTier, NodeId>> EverglintJointPolicy::collect_proact
     const StorageView& storage
 ) const {
     std::vector<std::pair<StorageTier, NodeId>> result;
-    if (config_.trim_gamma <= 0.0 || config_.wear_lambda <= 0.0) {
+    if (config_.trim_gamma <= 0.0 || active_wear_lambda_ <= 0.0) {
         return result;
     }
-    // Check periodically (every 16 requests) for O(1) amortized overhead.
     if (current_req_seq_ % 16 != 0) {
         return result;
     }
@@ -1139,28 +1277,32 @@ std::vector<std::pair<StorageTier, NodeId>> EverglintJointPolicy::collect_proact
     );
     std::unordered_set<NodeId> selected;
 
+    constexpr std::size_t kPerTierTrimCap = 512;
     for (StorageTier tier : {StorageTier::Slc, StorageTier::Tlc}) {
         const auto& leaf_set = ssd_leaf_set_[storage_tier_index(tier)];
         if (leaf_set.empty()) {
             continue;
         }
-        // Marginal GC holding cost is proportional to excess write amplification (WAF - 1):
-        // when a tier has ample free space (WAF == 1), proactive trimming yields zero GC savings.
         const double excess_waf = std::max(0.0, effective_waf(tier, storage) - 1.0);
         if (excess_waf <= 0.0) {
             continue;
         }
         const double base_delta =
             (excess_waf * static_cast<double>(block_size)) / region_budget_bytes(tier, storage);
+        const double weight =
+            (mode_ == Mode::Everglint)
+                ? (tier_minimax_weight(tier, storage) + config_.wear_eta)
+                : (0.5 + config_.wear_eta);
         const double trim_threshold =
-            config_.trim_gamma * config_.wear_lambda * (0.5 + config_.wear_eta) * base_delta;
+            config_.trim_gamma * active_wear_lambda_ * weight * base_delta;
         if (trim_threshold <= 0.0) {
             continue;
         }
 
         std::size_t scanned = 0;
+        std::size_t tier_trimmed = 0;
         for (const auto& [recency, leaf_id] : leaf_set) {
-            if (scanned >= config_.victim_limit || result.size() >= 1024) {
+            if (scanned >= config_.victim_limit || tier_trimmed >= kPerTierTrimCap) {
                 break;
             }
             ++scanned;
@@ -1169,7 +1311,7 @@ std::vector<std::pair<StorageTier, NodeId>> EverglintJointPolicy::collect_proact
             }
             std::optional<NodeId> cur = leaf_id;
             std::size_t chain_len = 0;
-            while (cur.has_value() && chain_len < 512 && result.size() < 1024) {
+            while (cur.has_value() && chain_len < 512 && tier_trimmed < kPerTierTrimCap) {
                 if (protected_set.count(*cur) || selected.count(*cur) || !tree.contains(*cur)) {
                     break;
                 }
@@ -1187,8 +1329,8 @@ std::vector<std::pair<StorageTier, NodeId>> EverglintJointPolicy::collect_proact
                 const auto [p_e, tau_e] = predict_node(mit->second);
                 static_cast<void>(tau_e);
                 const double q_e = (mode_ == Mode::Everglint)
-                                       ? survival_prob(mit->second, tier)
-                                       : uniform_survival_prob(mit->second);
+                                       ? survival_prob(mit->second, tier, storage)
+                                       : uniform_survival_prob(mit->second, storage);
                 const double val = p_e * q_e * block_recompute_cost(mit->second);
                 if (val >= trim_threshold) {
                     break;
@@ -1196,6 +1338,7 @@ std::vector<std::pair<StorageTier, NodeId>> EverglintJointPolicy::collect_proact
                 selected.insert(*cur);
                 result.emplace_back(tier, *cur);
                 ++chain_len;
+                ++tier_trimmed;
                 cur = tree.parent(*cur);
             }
         }

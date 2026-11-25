@@ -168,3 +168,42 @@ def test_everglint_ablations_run_cleanly(tmp_path):
         assert st["memory"]["peak_resident_blocks"] <= 4
         if name == "no_drop":
             assert st["memory"]["drop_blocks"] == 0
+
+
+def test_everglint_new_ablations_promotion_dual_and_measurement_window(tmp_path):
+    reqs = sample_agent_requests()
+    for name, extra in [
+        ("single_stratum", {"everglint_use_cadence_strata": False}),
+        ("plugin_mean", {"everglint_use_jensen_exact": False}),
+        ("no_coherence", {"everglint_use_session_coherence": False}),
+        ("hard_sigmoid", {"everglint_use_smooth_sigmoid": False}),
+        ("promote_hot", {"everglint_promote_hit_threshold": 2}),
+        ("closed_loop", {"everglint_target_life_years": 1.0, "everglint_dual_step_kappa": 0.25, "everglint_dual_window_ns": 5_000_000_000}),
+    ]:
+        cfg = SimulationConfig(
+            block_size_bytes=512,
+            memory=MemoryConfig(4 * 512),
+            slc=StorageTierConfig(6 * 512, 1),
+            tlc=StorageTierConfig(12 * 512, 1),
+            measurement_start_ns=10_000_000_000,
+            memory_policy=MemoryPolicyConfig(profile=True),
+            storage_policy=StoragePolicyConfig(
+                kind="everglint_joint",
+                everglint_mode="everglint",
+                everglint_wear_lambda=1.0e5,
+                everglint_chunk_blocks=2,
+                logical_fill_fraction=1.0,
+                **extra,
+            ),
+        )
+        with DWPDSimulator(cfg, tmp_path / f"{name}.csv") as sim:
+            sim.run(reqs)
+            perf = sim._core.memory_performance()
+            ext = sim._core.extended_access_stats()
+        st = sim.stats()
+        assert st["memory"]["peak_resident_blocks"] <= 4
+        assert ext["compute_cost_triangular"] <= ext["compute_cost"]
+        assert ext["compute_cost_triangular"] > 0
+        mw = ext["measurement_window"]
+        assert 0 < mw["requests"] < st["accesses"]["requests"]
+        assert perf["decisions"] > 0 and perf["decision_ns"] > 0

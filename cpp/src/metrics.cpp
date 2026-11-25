@@ -17,20 +17,27 @@ void MetricsCollector::record_request(TimestampNs timestamp_ns) noexcept {
     ++request_count;
 }
 
-void MetricsCollector::record_access(AccessResult result) noexcept {
+void MetricsCollector::record_access(AccessResult result, bool in_measurement) noexcept {
     ++block_access_count;
+    if (in_measurement) {
+        ++meas_block_access_count;
+    }
     switch (result) {
         case AccessResult::MemoryHit:
             ++memory_hits;
+            if (in_measurement) { ++meas_memory_hits; }
             break;
         case AccessResult::SlcHit:
             ++slc_hits;
+            if (in_measurement) { ++meas_slc_hits; }
             break;
         case AccessResult::TlcHit:
             ++tlc_hits;
+            if (in_measurement) { ++meas_tlc_hits; }
             break;
         case AccessResult::GlobalMiss:
             ++global_misses;
+            if (in_measurement) { ++meas_global_misses; }
             break;
     }
 }

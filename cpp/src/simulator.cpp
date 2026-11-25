@@ -200,6 +200,10 @@ void Simulator::process_request(
     std::optional<NodeId> parent_id;
     bool prefix_hit = true;
     std::uint64_t hit_blocks = 0;
+    const bool in_meas = timestamp_ns >= config_.measurement_start_ns;
+    if (in_meas) {
+        ++metrics_.meas_request_count;
+    }
     const auto ghost_prefix = shadow_ ? shadow_->ghost_prefix(hash_ids, hash_count, timestamp_ns) : 0;
     const std::uint64_t misses_before = metrics_.global_misses;
     for (std::size_t position = 0; position < hash_count; ++position) {
@@ -233,14 +237,24 @@ void Simulator::process_request(
             parent_id,
         });
         prefix_hit = prefix_hit && result != AccessResult::GlobalMiss;
-        metrics_.record_access(prefix_hit ? result : AccessResult::GlobalMiss);
+        metrics_.record_access(prefix_hit ? result : AccessResult::GlobalMiss, in_meas);
         if (prefix_hit) { ++hit_blocks; }
         parent_id = node_id;
     }
     if (shadow_) {
         shadow_->record_request(hit_blocks, ghost_prefix > hit_blocks ? ghost_prefix - hit_blocks : 0);
     }
-    metrics_.compute_cost += (metrics_.global_misses - misses_before) * hash_count;
+    const std::uint64_t req_misses = metrics_.global_misses - misses_before;
+    const std::uint64_t req_cost = req_misses * hash_count;
+    const std::uint64_t first_miss_depth = req_misses > 0 ? (hash_count - req_misses + 1) : 0;
+    const std::uint64_t req_cost_tri =
+        req_misses > 0 ? (req_misses * (first_miss_depth + hash_count)) / 2 : 0;
+    metrics_.compute_cost += req_cost;
+    metrics_.compute_cost_triangular += req_cost_tri;
+    if (in_meas) {
+        metrics_.meas_compute_cost += req_cost;
+        metrics_.meas_compute_cost_triangular += req_cost_tri;
+    }
     if (joint_policy_) {
         joint_policy_->on_request_end(
             request,
