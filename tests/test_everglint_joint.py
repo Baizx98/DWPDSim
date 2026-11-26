@@ -200,6 +200,7 @@ def test_everglint_new_ablations_promotion_dual_and_measurement_window(tmp_path)
             sim.run(reqs)
             perf = sim._core.memory_performance()
             ext = sim._core.extended_access_stats()
+            diag = sim._core.everglint_diagnostics()
         st = sim.stats()
         assert st["memory"]["peak_resident_blocks"] <= 4
         assert ext["compute_cost_triangular"] <= ext["compute_cost"]
@@ -207,3 +208,6 @@ def test_everglint_new_ablations_promotion_dual_and_measurement_window(tmp_path)
         mw = ext["measurement_window"]
         assert 0 < mw["requests"] < st["accesses"]["requests"]
         assert perf["decisions"] > 0 and perf["decision_ns"] > 0
+        assert "class_counters" in diag and "dual_trace" in diag
+        if name == "closed_loop":
+            assert len(diag["dual_trace"]) > 0

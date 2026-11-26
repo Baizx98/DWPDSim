@@ -49,7 +49,29 @@ struct EverglintJointPolicyConfig {
     std::uint64_t gandalf_hash_salt = 47;
     double target_life_years = 0.0;
     double dual_step_kappa = 0.0;
-    std::uint64_t dual_window_ns = 900ULL * 1000000000ULL;
+    std::uint64_t dual_window_ns = 600ULL * 1000000000ULL;
+};
+
+struct EverglintDualSample {
+    TimestampNs timestamp_ns = 0;
+    double active_lambda = 0.0;
+    double obs_rate_per_year = 0.0;
+    double ema_rate_per_year = 0.0;
+    double target_rate_per_year = 0.0;
+    double rho_slc = 0.0;
+    double rho_tlc = 0.0;
+};
+
+struct EverglintClassCounters {
+    std::uint64_t dram_hits = 0;
+    std::uint64_t slc_hits = 0;
+    std::uint64_t tlc_hits = 0;
+    std::uint64_t slc_writes = 0;
+    std::uint64_t tlc_writes = 0;
+    std::uint64_t drops = 0;
+    std::uint64_t idle_trims = 0;
+    std::uint64_t cap_trims = 0;
+    std::uint64_t clean_evicts = 0;
 };
 
 class EverglintJointPolicy final : public JointCachePolicy {
@@ -96,6 +118,14 @@ class EverglintJointPolicy final : public JointCachePolicy {
     ) const override;
     StoragePolicyStats stats(const StorageView& storage) const override;
 
+    const std::vector<EverglintDualSample>& dual_trace() const noexcept { return dual_trace_; }
+    const std::array<EverglintClassCounters, 2>& class_counters() const noexcept {
+        return class_counters_;
+    }
+    const std::array<EverglintClassCounters, 4>& stratum_counters() const noexcept {
+        return stratum_counters_;
+    }
+
   private:
     static constexpr std::size_t kNumBuckets = 32;
     static constexpr std::size_t kNumStrata = 4;  // 0: first-turn, 1: fast, 2: med, 3: slow
@@ -108,6 +138,7 @@ class EverglintJointPolicy final : public JointCachePolicy {
         double expired_beyond_h = 0.0;
 
         void init(double horizon);
+        void decay(double factor) noexcept;
         std::size_t bucket_for(double gap) const noexcept;
         void observe_return(double gap, double horizon);
         void observe_expired();
@@ -236,6 +267,10 @@ class EverglintJointPolicy final : public JointCachePolicy {
     double active_wear_lambda_ = 1.0e8;
     std::optional<TimestampNs> dual_window_start_ns_;
     std::array<double, 2> dual_window_start_rho_{0.0, 0.0};
+    std::optional<double> dual_rate_ema_;
+    std::vector<EverglintDualSample> dual_trace_;
+    std::array<EverglintClassCounters, 2> class_counters_{};
+    std::array<EverglintClassCounters, 4> stratum_counters_{};
 
     std::array<ReturnHistogram, kNumStrata> histograms_;
     std::unordered_map<AffinityId, SessionState> sessions_;

@@ -672,7 +672,7 @@ PYBIND11_MODULE(_core, module) {
             py::arg("everglint_gandalf_hash_salt") = 47ULL,
             py::arg("everglint_target_life_years") = 0.0,
             py::arg("everglint_dual_step_kappa") = 0.0,
-            py::arg("everglint_dual_window_ns") = 900000000000ULL
+            py::arg("everglint_dual_window_ns") = 600000000000ULL
         )
         .def("storage_performance", [](const Simulator& simulator) {
             py::dict result;
@@ -725,6 +725,51 @@ PYBIND11_MODULE(_core, module) {
             mw["memory_hit_rate"] = rate(metrics.meas_memory_hits, metrics.meas_block_access_count);
             mw["total_hit_rate"] = rate(meas_all_hits, metrics.meas_block_access_count);
             result["measurement_window"] = std::move(mw);
+            return result;
+        })
+        .def("everglint_diagnostics", [](const Simulator& simulator) {
+            py::dict result;
+            const auto* pol = dynamic_cast<const EverglintJointPolicy*>(simulator.joint_policy());
+            if (!pol) {
+                return result;
+            }
+            auto pack_counters = [](const EverglintClassCounters& c) {
+                py::dict d;
+                d["dram_hits"] = c.dram_hits;
+                d["slc_hits"] = c.slc_hits;
+                d["tlc_hits"] = c.tlc_hits;
+                d["slc_writes"] = c.slc_writes;
+                d["tlc_writes"] = c.tlc_writes;
+                d["drops"] = c.drops;
+                d["idle_trims"] = c.idle_trims;
+                d["cap_trims"] = c.cap_trims;
+                d["clean_evicts"] = c.clean_evicts;
+                return d;
+            };
+            py::dict cls;
+            cls["agent"] = pack_counters(pol->class_counters()[0]);
+            cls["chat"] = pack_counters(pol->class_counters()[1]);
+            result["class_counters"] = std::move(cls);
+
+            py::list strata;
+            for (const auto& sc : pol->stratum_counters()) {
+                strata.append(pack_counters(sc));
+            }
+            result["stratum_counters"] = std::move(strata);
+
+            py::list trace;
+            for (const auto& s : pol->dual_trace()) {
+                py::dict item;
+                item["timestamp_ns"] = s.timestamp_ns;
+                item["active_lambda"] = s.active_lambda;
+                item["obs_rate_per_year"] = s.obs_rate_per_year;
+                item["ema_rate_per_year"] = s.ema_rate_per_year;
+                item["target_rate_per_year"] = s.target_rate_per_year;
+                item["rho_slc"] = s.rho_slc;
+                item["rho_tlc"] = s.rho_tlc;
+                trace.append(std::move(item));
+            }
+            result["dual_trace"] = std::move(trace);
             return result;
         })
         .def(

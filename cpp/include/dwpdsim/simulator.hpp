@@ -54,6 +54,7 @@ class Simulator {
     const RadixTree& tree() const noexcept;
     const StorageState& storage() const noexcept;
     StoragePolicyStats storage_policy_stats() const;
+    const JointCachePolicy* joint_policy() const noexcept { return joint_policy_.get(); }
     const ShadowFtl* shadow() const { return shadow_.get(); }
     StoragePolicyWork storage_policy_work() const {
         return (config_.infinite_storage || !storage_policy_) ? StoragePolicyWork{} : storage_policy_->work();

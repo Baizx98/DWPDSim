@@ -110,7 +110,7 @@ class StoragePolicyConfig:
     everglint_gandalf_hash_salt: int = 47
     everglint_target_life_years: float = 0.0
     everglint_dual_step_kappa: float = 0.0
-    everglint_dual_window_ns: int = 900 * 1_000_000_000
+    everglint_dual_window_ns: int = 600 * 1_000_000_000
 
 
 @dataclass(frozen=True, slots=True)

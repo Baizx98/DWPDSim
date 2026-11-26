@@ -19,6 +19,14 @@ void EverglintJointPolicy::ReturnHistogram::init(double horizon) {
     expired_beyond_h = 0.0;
 }
 
+void EverglintJointPolicy::ReturnHistogram::decay(double factor) noexcept {
+    for (std::size_t i = 0; i < kNumBuckets; ++i) {
+        returned[i] *= factor;
+        return_sum[i] *= factor;
+    }
+    expired_beyond_h *= factor;
+}
+
 std::size_t EverglintJointPolicy::ReturnHistogram::bucket_for(double gap) const noexcept {
     const double g = std::max(1.0, gap);
     const auto it = std::lower_bound(edges.begin(), edges.end(), g);
@@ -242,13 +250,26 @@ void EverglintJointPolicy::on_request_begin(
                 const double d_rho_s = std::max(0.0, rho_s - dual_window_start_rho_[0]);
                 const double d_rho_t = std::max(0.0, rho_t - dual_window_start_rho_[1]);
                 const double obs_rate = std::max(d_rho_s, d_rho_t) / dt_years;
+                constexpr double alpha_r = 0.5;
+                dual_rate_ema_ = dual_rate_ema_.has_value()
+                                     ? ((1.0 - alpha_r) * (*dual_rate_ema_) + alpha_r * obs_rate)
+                                     : obs_rate;
                 const double target_rate = 1.0 / config_.target_life_years;
-                const double rel_err = std::clamp(obs_rate / target_rate - 1.0, -1.0, 1.0);
+                const double rel_err = std::clamp((*dual_rate_ema_) / target_rate - 1.0, -1.0, 1.0);
                 active_wear_lambda_ = std::clamp(
                     active_wear_lambda_ * std::exp(config_.dual_step_kappa * rel_err),
                     1.0e9,
                     3.0e11
                 );
+                dual_trace_.push_back(EverglintDualSample{
+                    request.timestamp_ns,
+                    active_wear_lambda_,
+                    obs_rate,
+                    *dual_rate_ema_,
+                    target_rate,
+                    rho_s,
+                    rho_t,
+                });
             }
             dual_window_start_ns_ = request.timestamp_ns;
             dual_window_start_rho_ = {rho_s, rho_t};
@@ -256,6 +277,15 @@ void EverglintJointPolicy::on_request_begin(
     }
 
     ++current_req_seq_;
+    // Periodic exponential histogram aging (half-life = horizon_requests) so stale sessions
+    // from prior epochs or non-stationary workload shifts decay cleanly instead of pinning p_i.
+    if (current_req_seq_ % 256 == 0) {
+        const double decay_factor =
+            std::pow(0.5, 256.0 / static_cast<double>(config_.horizon_requests));
+        for (auto& hist : histograms_) {
+            hist.decay(decay_factor);
+        }
+    }
     current_affinity_ = request.affinity_id == 0 ? request.request_id : request.affinity_id;
     current_req_blocks_ = std::max<double>(1.0, static_cast<double>(request.ordered_hashes.size));
 
@@ -436,7 +466,26 @@ void EverglintJointPolicy::on_memory_commit(
     if (it == nodes_.end()) {
         return;
     }
+    auto session_class = [](AffinityId sid) noexcept -> std::size_t {
+        const AffinityId base = sid >= 50000000ULL ? (sid - 50000000ULL) : sid;
+        return base >= 100000ULL ? 1 : 0;  // 0 = Agent, 1 = Chat
+    };
     NodeMeta& meta = it->second;
+    if (mutation.kind == MemoryMutationKind::Accessed) {
+        const std::size_t cls = session_class(current_affinity_);
+        ++class_counters_[cls].dram_hits;
+        ++stratum_counters_[session_stratum(current_affinity_)].dram_hits;
+    } else if (mutation.kind == MemoryMutationKind::Removed && tree.contains(mutation.node_id)) {
+        const std::size_t cls = session_class(meta.session_id);
+        const std::size_t st = session_stratum(meta.session_id);
+        if (!tree.node(mutation.node_id).on_storage) {
+            ++class_counters_[cls].drops;
+            ++stratum_counters_[st].drops;
+        } else {
+            ++class_counters_[cls].clean_evicts;
+            ++stratum_counters_[st].clean_evicts;
+        }
+    }
     if (mutation.kind == MemoryMutationKind::Inserted ||
         mutation.kind == MemoryMutationKind::Accessed) {
         if (meta.reuse_count == 0 || meta.last_req_seq != current_req_seq_) {
@@ -457,6 +506,10 @@ void EverglintJointPolicy::on_storage_commit(
     const StorageView& storage_after_commit
 ) {
     const RadixTree& tree = storage_after_commit.tree();
+    auto session_class = [](AffinityId sid) noexcept -> std::size_t {
+        const AffinityId base = sid >= 50000000ULL ? (sid - 50000000ULL) : sid;
+        return base >= 100000ULL ? 1 : 0;  // 0 = Agent, 1 = Chat
+    };
     switch (mutation.kind) {
         case StorageMutationKind::DumpWriteCommitted: {
             const std::size_t t = storage_tier_index(mutation.placement.tier);
@@ -478,6 +531,15 @@ void EverglintJointPolicy::on_storage_commit(
                 auto it = nodes_.find(id);
                 if (it != nodes_.end()) {
                     it->second.write_req_seq = current_req_seq_;
+                    const std::size_t cls = session_class(it->second.session_id);
+                    const std::size_t st = session_stratum(it->second.session_id);
+                    if (t == 0) {
+                        ++class_counters_[cls].slc_writes;
+                        ++stratum_counters_[st].slc_writes;
+                    } else {
+                        ++class_counters_[cls].tlc_writes;
+                        ++stratum_counters_[st].tlc_writes;
+                    }
                 }
                 refresh_node_sets(id, tree);
                 refresh_children_root_membership(id, tree);
@@ -488,8 +550,20 @@ void EverglintJointPolicy::on_storage_commit(
         case StorageMutationKind::IdleTrimCommitted: {
             const std::size_t t = storage_tier_index(mutation.source_tier);
             const double alpha = config_.residence_ema_alpha;
+            const bool is_idle = (mutation.kind == StorageMutationKind::IdleTrimCommitted);
             for (NodeId id : mutation.nodes) {
                 auto it = nodes_.find(id);
+                if (it != nodes_.end()) {
+                    const std::size_t cls = session_class(it->second.session_id);
+                    const std::size_t st = session_stratum(it->second.session_id);
+                    if (is_idle) {
+                        ++class_counters_[cls].idle_trims;
+                        ++stratum_counters_[st].idle_trims;
+                    } else {
+                        ++class_counters_[cls].cap_trims;
+                        ++stratum_counters_[st].cap_trims;
+                    }
+                }
                 if (it != nodes_.end() && it->second.write_req_seq > 0) {
                     const double res_age = std::max(
                         1.0,
@@ -515,9 +589,19 @@ void EverglintJointPolicy::on_storage_commit(
             break;
         }
         case StorageMutationKind::StorageAccessCommitted: {
+            const std::size_t hit_tier = storage_tier_index(mutation.source_tier);
             for (NodeId id : mutation.nodes) {
                 auto it = nodes_.find(id);
                 if (it != nodes_.end()) {
+                    const std::size_t cls = session_class(current_affinity_);
+                    const std::size_t st = session_stratum(current_affinity_);
+                    if (hit_tier == 0) {
+                        ++class_counters_[cls].slc_hits;
+                        ++stratum_counters_[st].slc_hits;
+                    } else {
+                        ++class_counters_[cls].tlc_hits;
+                        ++stratum_counters_[st].tlc_hits;
+                    }
                     if (it->second.reuse_count == 0 || it->second.last_req_seq != current_req_seq_) {
                         ++it->second.reuse_count;
                     }
